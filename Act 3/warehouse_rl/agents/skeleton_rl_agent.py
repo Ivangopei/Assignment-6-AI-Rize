@@ -114,26 +114,87 @@ class SkeletonOptimizationAgent(BaselineAgent):
     
     def _get_naive_layout_action(self, current_timestep) -> list:
         """
-        WEEK 1 STEP 1: Layout optimization - students should improve this!
-        
-        Current problems:
-        - Random swaps with no strategic purpose
-        - Ignores item co-occurrence patterns
-        - No consideration of delivery distances
-        - Wastes manager time on pointless moves
+        WEEK 1 STEP 1: Frequency-based layout optimization
+        Move frequently accessed items closer to delivery areas
         """
         
-        # TODO WEEK 1 STEP 1: Students should implement intelligent layout optimization
-        # Current approach: Occasionally make random swaps
+        # Only optimize every 100 steps to avoid disrupting operations
+        if current_timestep % 100 != 0:
+            return [0, 0]
         
-        if current_timestep % 100 == 0 and np.random.random() < 0.2:  # Random timing
-            # Pick two random positions to swap
-            grid_size = self.env.grid_width * self.env.grid_height
-            pos1 = np.random.randint(0, grid_size)
-            pos2 = np.random.randint(0, grid_size)
-            return [pos1, pos2]
+        grid = self.env.warehouse_grid
         
-        return [0, 0]  # No swap
+        # Get item frequency data from environment
+        frequencies = grid.item_access_frequency
+        active_frequencies = frequencies[frequencies > 0]
+        if len(active_frequencies) == 0:
+            return [0, 0]
+        
+        # Identify "hot" items (top 25% by access frequency)
+        hot_threshold = np.percentile(active_frequencies, 75)
+        hot_items = [item for item in range(len(frequencies))
+                     if frequencies[item] >= hot_threshold and frequencies[item] > 0]
+        # Most popular items first
+        hot_items.sort(key=lambda item: frequencies[item], reverse=True)
+        
+        # Find delivery positions
+        delivery_positions = getattr(grid, 'truck_bay_positions', [(grid.width // 2, grid.height // 2)])
+        
+        # For each hot item, check if it's far from delivery
+        for item in hot_items:
+            for location in grid.find_item_locations(item):
+                distance = min(grid.manhattan_distance(location, d) for d in delivery_positions)
+                
+                # If hot item is >3 steps from delivery, find closer position
+                if distance > 3:
+                    swap = self._find_closer_position(location, delivery_positions)
+                    if swap:
+                        return swap
+        
+        return [0, 0]  # No beneficial swap found
+    
+    def _find_closer_position(self, current_pos, delivery_positions):
+        """
+        Greedy neighborhood search for better item placement.
+        
+        Algorithm: Exhaustive search of all storage positions to find
+        the position that minimizes distance to delivery points.
+        
+        Returns [current_index, target_index] if beneficial swap found.
+        """
+        grid = self.env.warehouse_grid
+        frequencies = grid.item_access_frequency
+        current_idx = current_pos[1] * grid.width + current_pos[0]
+        current_dist = min(grid.manhattan_distance(current_pos, delivery_pos) 
+                          for delivery_pos in delivery_positions)
+        current_item = grid.item_grid[current_pos[1], current_pos[0]]
+        current_freq = frequencies[current_item] if current_item >= 0 else 0
+        
+        best_idx = None
+        best_improvement = 1  # Require more than 1 step closer
+        
+        for y in range(grid.height):
+            for x in range(grid.width):
+                # Only consider storage cells
+                if grid.cell_types[y, x] != 1:
+                    continue
+                
+                # Don't push out an item that is just as popular
+                target_item = grid.item_grid[y, x]
+                if target_item >= 0 and frequencies[target_item] >= current_freq:
+                    continue
+                
+                candidate_dist = min(grid.manhattan_distance((x, y), d) for d in delivery_positions)
+                improvement = current_dist - candidate_dist
+                
+                # Greedy selection: keep the position with the biggest improvement
+                if improvement > best_improvement:
+                    best_improvement = improvement
+                    best_idx = y * grid.width + x
+        
+        if best_idx is not None:
+            return [current_idx, best_idx]
+        return None  # No better position found
     
     def _get_naive_order_assignments(self, queue_info, employee_info) -> list:
         """
