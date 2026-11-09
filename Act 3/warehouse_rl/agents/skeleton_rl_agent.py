@@ -82,33 +82,45 @@ class SkeletonOptimizationAgent(BaselineAgent):
     
     def _get_naive_staffing_action(self, financial_state, employee_info) -> int:
         """
-        WEEK 2 STEP 1: Staffing decisions - students should improve this!
-        
-        Current problems:
-        - Ignores queue length and workload
-        - Random decisions regardless of profit
-        - No consideration of employee efficiency
+        WEEK 2 STEP 1: Economic staffing optimization
+        Make hiring/firing decisions based on simple business economics
         """
         
-        # TODO WEEK 2 STEP 1: Students should implement intelligent staffing logic
-        # Current approach: Make random decisions based on "vibes"
-        
+        # Extract economic and operational data
         current_profit = financial_state[0]
-        num_employees = np.sum(employee_info[:, 0] > 0)  # Count active employees
         
-        # Terrible logic: Random decisions with slight bias
-        # BUT: Hire managers more frequently so layout optimization can work
-        has_manager = np.any(employee_info[:, 5] == 1)  # Check if we have a manager
+        employees = self.env.employees
+        num_workers = sum(1 for emp in employees if not emp.is_manager)
+        has_manager = any(emp.is_manager for emp in employees)
+        queue_length = len(self.env.order_queue.orders)
         
-        if np.random.random() < 0.3:  # 30% chance to hire
-            if num_employees < 20:  # Don't go completely overboard
-                return 1  # Hire worker
-        elif np.random.random() < 0.1:  # 10% chance to fire
-            if num_employees > 1:  # Don't fire everyone
-                return 2  # Fire worker
-        elif np.random.random() < 0.2:  # 20% chance to hire manager (increased from 5%)
-            if not has_manager or num_employees > 10:  # Hire manager if we don't have one, or if we have lots of workers
-                return 3  # Hire manager
+        # Algorithm parameters
+        min_workers = 4            # Baseline capacity so orders always get picked up
+        max_workers = 8            # Cap so salaries can't eat all the profit
+        hire_threshold = 3.0       # Hire when more than 3 orders per worker are waiting
+        fire_threshold = 1.5       # Fire when fewer than 1.5 orders per worker are waiting
+        profit_threshold = 1000    # Only grow past baseline when we can afford wages
+        
+        # Business indicator: queue pressure (demand vs capacity)
+        queue_pressure = queue_length / max(1, num_workers)
+        
+        # Always keep one manager so layout optimization can run
+        if not has_manager:
+            return 3  # Hire manager
+        
+        # Always keep a minimum crew
+        if num_workers < min_workers:
+            return 1  # Hire worker
+        
+        # HIRE: high demand + profitable + below the cap
+        if (queue_pressure > hire_threshold and current_profit > profit_threshold
+                and num_workers < max_workers):
+            return 1  # Hire worker
+        
+        # FIRE: low demand + above the minimum crew
+        # (buffer zone between 1.5 and 3.0 prevents hire/fire flip-flopping)
+        if queue_pressure < fire_threshold and num_workers > min_workers:
+            return 2  # Fire worker
         
         return 0  # No action
     
@@ -198,30 +210,76 @@ class SkeletonOptimizationAgent(BaselineAgent):
     
     def _get_naive_order_assignments(self, queue_info, employee_info) -> list:
         """
-        WEEK 2 STEP 2: Order assignment - students should improve this!
-        
-        Current problems:
-        - Ignores employee locations
-        - No consideration of order priority/value
-        - Random assignments regardless of efficiency
-        - Doesn't check if employees are actually available
+        WEEK 2 STEP 2: Worker-to-order matching optimization
+        Greedily match idle workers to pending orders using distance and value
         """
         
-        # TODO WEEK 2 STEP 2: Students should implement intelligent order assignment
-        # Current approach: Random assignments
+        assignments = [0] * 20  # Initialize with no assignments
         
-        assignments = [0] * 20  # No assignments by default
+        idle_workers = self._get_idle_workers(employee_info)
+        orders = self.env.order_queue.orders[:20]
         
-        # Count how many employees we have (very naive)
-        num_employees = int(np.sum(employee_info[:, 0] > 0))
+        # If no workers or orders available, nothing to assign
+        if not idle_workers or not orders:
+            return assignments
         
-        # Randomly assign first few orders to first few employees
-        if num_employees > 0:
-            for i in range(min(3, num_employees)):  # Only assign 3 orders max
-                if np.random.random() < 0.6:  # 60% chance to assign
-                    assignments[i] = (i % num_employees) + 1  # Random employee
+        distance_weight = 0.7  # Walking efficiency matters most
+        value_weight = 0.3     # Revenue matters too
+        max_value = max(order.value for order in orders) or 1
+        
+        # Score every worker-order pair
+        candidates = []
+        for order_idx, order in enumerate(orders):
+            if order.status != "pending":
+                continue
+            value_score = order.value / max_value
+            for worker_idx, worker_pos in idle_workers:
+                distance = self._calculate_order_distance(worker_pos, order)
+                distance_score = 1 / (1 + distance)
+                score = distance_weight * distance_score + value_weight * value_score
+                candidates.append((score, worker_idx, order_idx))
+        
+        # Greedy assignment: best-scoring pairs first, each worker/order used once
+        candidates.sort(reverse=True)
+        assigned_workers = set()
+        assigned_orders = set()
+        for score, worker_idx, order_idx in candidates:
+            if worker_idx in assigned_workers or order_idx in assigned_orders:
+                continue
+            assignments[order_idx] = worker_idx + 1  # Environment uses 1-based worker numbers
+            assigned_workers.add(worker_idx)
+            assigned_orders.add(order_idx)
         
         return assignments
+    
+    def _calculate_order_distance(self, worker_pos, order):
+        """
+        Calculate minimum distance from worker to any item needed for this order.
+        """
+        grid = self.env.warehouse_grid
+        min_distance = float('inf')
+        
+        for item_type in order.items:
+            for location in grid.find_item_locations(item_type):
+                distance = grid.manhattan_distance(worker_pos, location)
+                if distance < min_distance:
+                    min_distance = distance
+        
+        return min_distance if min_distance != float('inf') else 0
+    
+    def _get_idle_workers(self, employee_info):
+        """
+        Identify workers available for order assignment.
+        Returns list of (worker_index, worker_position) for idle, non-manager workers.
+        """
+        idle_workers = []
+        
+        for i, employee in enumerate(self.env.employees[:len(employee_info)]):
+            if (not employee.is_manager and employee.state.value == 0  # 0 = IDLE
+                    and employee.current_order_id is None):
+                idle_workers.append((i, employee.position))
+        
+        return idle_workers
     
     def record_reward(self, reward: float):
         """
